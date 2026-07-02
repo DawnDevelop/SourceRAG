@@ -1,0 +1,16 @@
+# Copy this file to repos.yaml (gitignored) and fill in your own organization
+# and repo list. Keep the real file out of git -- project/repo names here
+# often reveal internal structure or client relationships that shouldn't be
+# committed to a shared repo.
+#
+# Clone URL is built as: {organization}/{project}/_git/{name}
+
+azure_devops:
+  organization: "https://dev.azure.com/your-org"
+
+repos:
+  - project: "YourProject"
+    name: "service-a"
+  - project: "YourProject"
+    name: "service-b"
+    branch: "develop" # optional -- omit to clone/pull the repo's default branch

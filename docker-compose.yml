@@ -1,0 +1,28 @@
+services:
+  chroma:
+    image: chromadb/chroma:latest
+    volumes:
+      - chroma_data:/chroma/chroma
+    ports:
+      - "8001:8000" # optional: browse/debug the raw Chroma API at localhost:8001
+
+  indexer:
+    build: ./indexer
+    env_file: .env
+    volumes:
+      - ./config:/config:ro
+      - repo_data:/data/repos
+    depends_on:
+      - chroma
+
+  api:
+    build: ./api
+    env_file: .env
+    ports:
+      - "8080:8000"
+    depends_on:
+      - chroma
+
+volumes:
+  chroma_data:
+  repo_data:
