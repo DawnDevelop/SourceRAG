@@ -1,10 +1,16 @@
 services:
   chroma:
-    image: chromadb/chroma:latest
+    image: chromadb/chroma:0.5.23 # pinned to match chromadb-client==0.5.23 in api/ and indexer/
     volumes:
       - chroma_data:/chroma/chroma
     ports:
       - "8001:8000" # optional: browse/debug the raw Chroma API at localhost:8001
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v2/heartbeat"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
 
   indexer:
     build: ./indexer
@@ -13,7 +19,8 @@ services:
       - ./config:/config:ro
       - repo_data:/data/repos
     depends_on:
-      - chroma
+      chroma:
+        condition: service_healthy
 
   api:
     build: ./api
@@ -21,7 +28,8 @@ services:
     ports:
       - "8080:8000"
     depends_on:
-      - chroma
+      chroma:
+        condition: service_healthy
 
 volumes:
   chroma_data:
