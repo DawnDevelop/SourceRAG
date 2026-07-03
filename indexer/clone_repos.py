@@ -3,16 +3,11 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
 
-import yaml
+from repos_config import load_config, valid_repos
 
 CONFIG_PATH = os.environ.get("REPOS_CONFIG", "/config/repos.yaml")
 DATA_DIR = os.environ.get("REPO_DATA_DIR", "/data/repos")
 CLONE_CONCURRENCY = int(os.environ.get("CLONE_CONCURRENCY", "8"))
-
-
-def load_config():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
 
 
 def repo_url(org_url, project, name):
@@ -46,18 +41,9 @@ def sync_repo(org_url, project, name, branch=None):
 
 
 def main():
-    config = load_config()
+    config = load_config(CONFIG_PATH)
     org_url = config["azure_devops"]["organization"]
-    raw_repos = config["repos"]
-
-    # A single malformed entry (e.g. a "name:" line misplaced during editing)
-    # shouldn't take the whole ~200-repo sync down -- skip it and keep going.
-    repos = []
-    for i, r in enumerate(raw_repos):
-        if "project" not in r or "name" not in r:
-            print(f"[config-error] repos.yaml entry #{i} is missing 'project' or 'name', skipping: {r}")
-            continue
-        repos.append(r)
+    repos = valid_repos(config)
 
     failures = []
     with ThreadPoolExecutor(max_workers=CLONE_CONCURRENCY) as pool:

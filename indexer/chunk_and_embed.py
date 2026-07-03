@@ -7,10 +7,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import yaml
 import chromadb
 from openai import OpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
+
+from repos_config import load_config, valid_repos
 
 CONFIG_PATH = os.environ.get("REPOS_CONFIG", "/config/repos.yaml")
 DATA_DIR = os.environ.get("REPO_DATA_DIR", "/data/repos")
@@ -157,17 +158,15 @@ def get_head_commit(repo_root):
     return result.stdout.strip()
 
 
-def git_diff_status(repo_root, old_commit, new_commit):
-    """[(status, rel_path)] changed between two commits, status in "A"/"M"/"D".
-    Renames (git detects via -M) are resolved to a delete of the old path
-    plus an add of the new path, so callers don't need special rename logic.
+def parse_name_status(output):
+    """Parse `git diff --name-status` output into [(status, rel_path)],
+    status in "A"/"M"/"D". Renames (git detects via -M) are resolved to a
+    delete of the old path plus an add of the new path, so callers don't
+    need special rename logic. Typechanges (T, e.g. symlink -> regular
+    file) are treated as modifications so the new content gets indexed.
     """
-    result = subprocess.run(
-        ["git", "-C", repo_root, "diff", "--name-status", "-M", old_commit, new_commit],
-        capture_output=True, text=True, check=True,
-    )
     changes = []
-    for line in result.stdout.splitlines():
+    for line in output.splitlines():
         if not line.strip():
             continue
         parts = line.split("\t")
@@ -177,8 +176,16 @@ def git_diff_status(repo_root, old_commit, new_commit):
             changes.append(("D", old_path))
             changes.append(("A", new_path))
         else:
-            changes.append((status[0], parts[1]))
+            changes.append(("M" if status[0] == "T" else status[0], parts[1]))
     return changes
+
+
+def git_diff_status(repo_root, old_commit, new_commit):
+    result = subprocess.run(
+        ["git", "-C", repo_root, "diff", "--name-status", "-M", old_commit, new_commit],
+        capture_output=True, text=True, check=True,
+    )
+    return parse_name_status(result.stdout)
 
 
 def chunk_id(project, repo, rel_path, index):
@@ -327,6 +334,13 @@ def delete_path_chunks(collection, project, name, rel_path):
     ]})
 
 
+def delete_repo_chunks(collection, project, name):
+    collection.delete(where={"$and": [
+        {"project": {"$eq": project}},
+        {"repo": {"$eq": name}},
+    ]})
+
+
 def embed_batch(texts):
     # Qwen3-Embedding expects documents with no special prefix -- the
     # instruction+query prefix (see api/main.py) is query-side only.
@@ -412,6 +426,13 @@ def embed_files(collection, project, name, repo_root, file_specs):
 
 
 def full_index_repo(collection, project, name, repo_root):
+    # Chroma's add() silently skips IDs that already exist, so a full pass
+    # over a repo that still has chunks in the collection (fallback after an
+    # unusable stored commit, or a lost state file) would keep every stale
+    # chunk: deleted files stay searchable and modified files keep their old
+    # embeddings. Drop the repo's chunks first; on a fresh repo this is a
+    # no-op.
+    delete_repo_chunks(collection, project, name)
     return embed_files(collection, project, name, repo_root, list(iter_files(repo_root)))
 
 
@@ -480,14 +501,10 @@ def index_repo(collection, project, name, repo_root, progress, state):
 
 
 def main():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
+    config = load_config(CONFIG_PATH)
 
     synced = []
-    for i, repo in enumerate(config["repos"]):
-        if "project" not in repo or "name" not in repo:
-            log(f"[config-error] repos.yaml entry #{i} is missing 'project' or 'name', skipping: {repo}")
-            continue
+    for repo in valid_repos(config):
         project, name = repo["project"], repo["name"]
         repo_root = os.path.join(DATA_DIR, project, name)
         if not os.path.isdir(repo_root):

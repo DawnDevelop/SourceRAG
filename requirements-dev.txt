@@ -1,0 +1,5 @@
+# Everything the test suite needs: both services' runtime deps plus pytest.
+# Usage: python -m venv .venv && .venv/Scripts/pip install -r requirements-dev.txt
+-r api/requirements.txt
+-r indexer/requirements.txt
+pytest==8.3.4

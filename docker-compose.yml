@@ -4,7 +4,9 @@ services:
     volumes:
       - chroma_data:/chroma/chroma
     ports:
-      - "8001:8000" # optional: browse/debug the raw Chroma API at localhost:8001
+      # Loopback only -- the index contains internal source code and Chroma
+      # has no auth, so it must not be reachable from the LAN.
+      - "127.0.0.1:8001:8000" # optional: browse/debug the raw Chroma API at localhost:8001
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/v2/heartbeat"]
       interval: 5s
@@ -26,7 +28,9 @@ services:
     build: ./api
     env_file: .env
     ports:
-      - "8080:8000"
+      # Loopback only -- /search and /mcp serve internal source code with no
+      # auth, so they must not be reachable from the LAN.
+      - "127.0.0.1:8080:8000"
     depends_on:
       chroma:
         condition: service_healthy

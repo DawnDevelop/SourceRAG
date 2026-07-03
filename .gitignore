@@ -1,6 +1,7 @@
-# Real repo list encodes internal project/client names -- never commit it.
+# Real repo lists encode internal project/client names -- never commit them.
 # Copy config/repos.yaml.example to config/repos.yaml and fill in your own.
 /config/repos.yaml
+/config/repos.smoketest.yaml
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
