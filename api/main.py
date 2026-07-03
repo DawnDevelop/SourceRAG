@@ -83,10 +83,21 @@ mcp = FastMCP("sourcerag", streamable_http_path="/")
 
 @mcp.tool()
 def search_code(query: str, top_k: int = 8, repo: str = "", language: str = "") -> list[dict]:
-    """Semantically search indexed code across all configured Azure DevOps repos.
+    """Semantically search indexed source code across all of the org's Azure DevOps repos.
 
-    Use this before implementing something new to check whether equivalent
-    functionality already exists somewhere in the org's repos.
+    USE FOR: any question about whether code, a function, a class, a service,
+    or a pattern already exists somewhere in the org -- e.g. "does X exist",
+    "have we already built Y", "is there an existing implementation of Z",
+    "where do we do X elsewhere", "find examples of X in our repos". Also use
+    before writing new code, to check for something reusable first.
+
+    Call this proactively whenever a question is about the org's own codebase
+    rather than public/general knowledge, even if the user doesn't mention
+    "search" or name this tool.
+
+    DO NOT USE FOR: code already open in the current session/repo (use local
+    file search instead), or general programming questions unrelated to this
+    org's code.
 
     Args:
         query: Natural language or code description of what you're looking for.
