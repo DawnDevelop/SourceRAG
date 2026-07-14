@@ -34,8 +34,10 @@ services:
     environment:
       DATABASE_URL: postgresql://sourcerag:sourcerag@postgres:5432/sourcerag
     ports:
-      # Loopback only -- /search and /mcp serve internal source code with no
-      # auth, so they must not be reachable from the LAN.
+      # Loopback by default: auth is optional (AGENT_API_KEY / OAUTH_ISSUER,
+      # see .env.example), so without it this binding is the only thing
+      # keeping the indexed source code off the LAN. Only widen this bind
+      # with auth configured, and set PUBLIC_BASE_URL accordingly.
       - "127.0.0.1:4141:8000"
     depends_on:
       postgres:

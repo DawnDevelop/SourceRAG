@@ -2,4 +2,5 @@ fastapi==0.115.5
 uvicorn[standard]==0.32.1
 openai==1.55.3
 psycopg[binary]==3.2.3
-mcp==1.9.4
+mcp==1.28.0
+PyJWT[crypto]==2.13.0

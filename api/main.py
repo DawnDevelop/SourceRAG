@@ -5,9 +5,12 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Optional
 
 import psycopg
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 from openai import OpenAI
+
+from auth import AUTH_ENABLED, OAUTH_ISSUER, OAUTH_SCOPES, PUBLIC_BASE_URL, require_auth, verifier
 
 LLM_BASE_URL = os.environ["LLM_BASE_URL"]
 LLM_API_KEY = os.environ["LLM_API_KEY"]
@@ -268,7 +271,21 @@ def find_duplicate_clusters(min_repos: int = 2, min_chars: int = DEFAULT_DUPLICA
 # MCP tools -- share search_chunks/find_duplicate_clusters with the REST
 # routes below rather than calling them over HTTP, so there's exactly one
 # implementation of each.
-mcp = FastMCP("sourcerag", streamable_http_path="/")
+# The SDK rejects a token_verifier without AuthSettings (and vice versa), so
+# in open mode both are omitted entirely rather than passed as no-ops.
+mcp_auth_args = {}
+if AUTH_ENABLED:
+    mcp_auth_args = {
+        "token_verifier": verifier,
+        "auth": AuthSettings(
+            # The SDK insists on an issuer even in static-key-only mode; pointing
+            # it at ourselves is inert (no human OAuth client should connect then).
+            issuer_url=OAUTH_ISSUER or PUBLIC_BASE_URL,
+            resource_server_url=f"{PUBLIC_BASE_URL}/mcp",
+            required_scopes=OAUTH_SCOPES or None,
+        ),
+    }
+mcp = FastMCP("sourcerag", streamable_http_path="/", **mcp_auth_args)
 
 
 @mcp.tool()
@@ -375,7 +392,21 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/search")
+@app.get("/.well-known/oauth-protected-resource/mcp")
+@app.get("/.well-known/oauth-protected-resource")
+def oauth_protected_resource():
+    # Claude Code follows the 401's resource_metadata URL, which RFC 9728 puts
+    # at the ROOT (/.well-known/... inserted between host and path). The copy
+    # the SDK registers lives inside the /mcp mount and is unreachable there.
+    meta = {"resource": f"{PUBLIC_BASE_URL}/mcp",
+            "authorization_servers": [OAUTH_ISSUER or PUBLIC_BASE_URL],
+            "bearer_methods_supported": ["header"]}
+    if OAUTH_SCOPES:
+        meta["scopes_supported"] = OAUTH_SCOPES
+    return meta
+
+
+@app.get("/search", dependencies=[Depends(require_auth)])
 def search(q: str, top_k: int = 8, repo: Optional[str] = None, language: Optional[str] = None,
            path_contains: Optional[str] = None, min_score: float = 0.0,
            compact: bool = False, max_chars: int = 0, content_type: Optional[str] = None):
@@ -385,7 +416,7 @@ def search(q: str, top_k: int = 8, repo: Optional[str] = None, language: Optiona
         raise HTTPException(status_code=503, detail=str(e))
 
 
-@app.get("/duplicates")
+@app.get("/duplicates", dependencies=[Depends(require_auth)])
 def duplicates(min_repos: int = 2, min_chars: int = DEFAULT_DUPLICATE_MIN_CHARS,
                limit: int = 50, content_type: str = "code"):
     try:

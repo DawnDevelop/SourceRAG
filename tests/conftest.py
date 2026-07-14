@@ -14,6 +14,7 @@ os.environ.setdefault("EMBEDDING_MODEL", "test-model")
 # database fails fast with a refused connection instead of hanging. Database
 # access itself is lazy in both modules, so importing needs no server.
 os.environ.setdefault("DATABASE_URL", "postgresql://x:x@127.0.0.1:1/none?connect_timeout=1")
+os.environ.setdefault("AGENT_API_KEY", "test-agent-key")
 
 import chunk_and_embed  # noqa: E402,F401
 import main  # noqa: E402,F401
