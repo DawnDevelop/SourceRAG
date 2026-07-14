@@ -1,14 +1,16 @@
 services:
-  chroma:
-    image: chromadb/chroma:0.5.23 # pinned to match chromadb-client==0.5.23 in api/ and indexer/
+  postgres:
+    image: pgvector/pgvector:pg18
+    environment:
+      POSTGRES_USER: sourcerag
+      POSTGRES_PASSWORD: sourcerag
+      POSTGRES_DB: sourcerag
     volumes:
-      - chroma_data:/chroma/chroma
+      - pg_data:/var/lib/postgresql
     ports:
-      # Loopback only -- the index contains internal source code and Chroma
-      # has no auth, so it must not be reachable from the LAN.
-      - "127.0.0.1:8001:8000" # optional: browse/debug the raw Chroma API at localhost:8001
+      - "127.0.0.1:5433:5432" # optional: inspect the index with psql at localhost:5433
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v2/heartbeat"]
+      test: ["CMD-SHELL", "pg_isready -U sourcerag -d sourcerag"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -17,24 +19,28 @@ services:
   indexer:
     build: ./indexer
     env_file: .env
+    environment:
+      DATABASE_URL: postgresql://sourcerag:sourcerag@postgres:5432/sourcerag
     volumes:
       - ./config:/config:ro
       - repo_data:/data/repos
     depends_on:
-      chroma:
+      postgres:
         condition: service_healthy
 
   api:
     build: ./api
     env_file: .env
+    environment:
+      DATABASE_URL: postgresql://sourcerag:sourcerag@postgres:5432/sourcerag
     ports:
       # Loopback only -- /search and /mcp serve internal source code with no
       # auth, so they must not be reachable from the LAN.
-      - "127.0.0.1:8080:8000"
+      - "127.0.0.1:4141:8000"
     depends_on:
-      chroma:
+      postgres:
         condition: service_healthy
 
 volumes:
-  chroma_data:
+  pg_data:
   repo_data:

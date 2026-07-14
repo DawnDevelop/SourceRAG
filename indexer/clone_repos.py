@@ -3,7 +3,7 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
 
-from repos_config import load_config, valid_repos
+from repos_config import load_config, valid_repos, wiki_repos, should_index_wikis
 
 CONFIG_PATH = os.environ.get("REPOS_CONFIG", "/config/repos.yaml")
 DATA_DIR = os.environ.get("REPO_DATA_DIR", "/data/repos")
@@ -44,6 +44,10 @@ def main():
     config = load_config(CONFIG_PATH)
     org_url = config["azure_devops"]["organization"]
     repos = valid_repos(config)
+    if should_index_wikis(config):
+        # A project with no wiki simply has no ".wiki" git repo to clone --
+        # that shows up below as an ordinary clone failure, not a crash.
+        repos = repos + wiki_repos(config)
 
     failures = []
     with ThreadPoolExecutor(max_workers=CLONE_CONCURRENCY) as pool:

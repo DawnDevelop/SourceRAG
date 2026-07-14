@@ -1,5 +1,5 @@
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
 openai==1.55.3
-chromadb-client==0.5.23
+psycopg[binary]==3.2.3
 mcp==1.9.4

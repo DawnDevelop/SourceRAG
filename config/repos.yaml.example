@@ -4,13 +4,44 @@
 # committed to a shared repo.
 #
 # Clone URL is built as: {organization}/{project}/_git/{name}
+#
+# `repos` is a mapping of ADO project -> repos in that project. Value shapes:
+#   ProjectName:                    # (blank) single repo, name == project name
+#   ProjectName: repo-name          # single repo, name differs from the project
+#   ProjectName: [repo-a, repo-b]   # multiple repos, each clones its default branch
+#   ProjectName:                    # multiple repos, with a per-repo branch override
+#     - repo-a
+#     - name: repo-b
+#       branch: develop
 
 azure_devops:
   organization: "https://dev.azure.com/your-org"
 
+  # Optional, both default false -- opt in to indexing content beyond code.
+  # Neither changes existing search results unless you also filter/query for
+  # them (search results mix content_type: code/wiki/pr once enabled).
+  #
+  # index_wikis: clones each project's wiki (Azure DevOps project wikis are
+  # themselves a git repo named "<project>.wiki") and indexes its pages
+  # alongside code. Projects without a wiki log a harmless clone failure --
+  # not an error, just "this project has no wiki".
+  index_wikis: false
+  #
+  # index_pull_requests: fetches each repo's PR titles+descriptions via the
+  # Azure DevOps REST API (not git) and indexes them so search surfaces the
+  # "why" behind a change. Incremental by PR id only -- a PR's description
+  # edited after it was first indexed will not be re-fetched.
+  index_pull_requests: false
+
 repos:
-  - project: "YourProject"
-    name: "service-a"
-  - project: "YourProject"
-    name: "service-b"
-    branch: "develop" # optional -- omit to clone/pull the repo's default branch
+  YourProject:
+    - service-a
+    - name: service-b
+      branch: develop # optional -- omit to clone/pull the repo's default branch
+
+  # Shorthand for a project containing a single repo of the same name --
+  # common for infra/tooling projects (e.g. "YourInfraProject/YourInfraProject").
+  YourInfraProject:
+
+  # Shorthand for a single repo whose name differs from its project.
+  YourOtherProject: some-repo-name
