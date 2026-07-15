@@ -3,11 +3,13 @@ import os
 import re
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Optional
+from urllib.parse import urlparse
 
 import psycopg
 from fastapi import Depends, FastAPI, HTTPException
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from openai import OpenAI
 
 from auth import AUTH_ENABLED, OAUTH_ISSUER, OAUTH_SCOPES, PUBLIC_BASE_URL, require_auth, verifier
@@ -285,7 +287,15 @@ if AUTH_ENABLED:
             required_scopes=OAUTH_SCOPES or None,
         ),
     }
-mcp = FastMCP("sourcerag", streamable_http_path="/", **mcp_auth_args)
+
+
+_public_host = urlparse(PUBLIC_BASE_URL).netloc
+mcp_transport_security = TransportSecuritySettings(
+    allowed_hosts=[_public_host, "127.0.0.1:*", "localhost:*", "[::1]:*"],
+    allowed_origins=[PUBLIC_BASE_URL, "http://127.0.0.1:*", "http://localhost:*"],
+)
+mcp = FastMCP("sourcerag", streamable_http_path="/",
+              transport_security=mcp_transport_security, **mcp_auth_args)
 
 
 @mcp.tool()
