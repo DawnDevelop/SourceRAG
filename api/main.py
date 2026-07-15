@@ -290,10 +290,16 @@ if AUTH_ENABLED:
 
 
 _public_host = urlparse(PUBLIC_BASE_URL).netloc
+if not _public_host:
+    raise RuntimeError(
+        f"PUBLIC_BASE_URL must include a scheme (https://...), got {PUBLIC_BASE_URL!r}"
+    )
 mcp_transport_security = TransportSecuritySettings(
     allowed_hosts=[_public_host, "127.0.0.1:*", "localhost:*", "[::1]:*"],
     allowed_origins=[PUBLIC_BASE_URL, "http://127.0.0.1:*", "http://localhost:*"],
 )
+
+print(f"[mcp] transport security allowed hosts: {mcp_transport_security.allowed_hosts}", flush=True)
 mcp = FastMCP("sourcerag", streamable_http_path="/",
               transport_security=mcp_transport_security, **mcp_auth_args)
 
