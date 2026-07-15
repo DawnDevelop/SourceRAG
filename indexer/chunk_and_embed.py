@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import psycopg
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
 
 import pull_requests
@@ -36,6 +36,7 @@ EMBED_BATCH = int(os.environ.get("EMBED_BATCH_SIZE", "32"))
 # model server can actually parallelize, not by host CPU cores.
 INDEX_CONCURRENCY = int(os.environ.get("INDEX_CONCURRENCY", "4"))
 EMBED_CONCURRENCY = int(os.environ.get("EMBED_CONCURRENCY", "2"))
+EMBED_MAX_RETRIES = int(os.environ.get("EMBED_MAX_RETRIES", "6"))
 
 LM_BASE_URL = os.environ["LLM_BASE_URL"]
 LM_API_KEY = os.environ["LLM_API_KEY"]
@@ -537,9 +538,33 @@ def embed_batch(texts):
     # Bounded separately from INDEX_CONCURRENCY: this hits LM Studio's actual
     # model server, which can only usefully parallelize so much regardless of
     # how many host CPU cores are free.
+    # The semaphore is deliberately held across rate-limit sleeps: while the
+    # provider is throttling us there's no point letting another thread rush
+    # in and burn the same exhausted quota window.
     with embed_semaphore:
-        resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
-        return [d.embedding for d in resp.data]
+        return _embed_with_retry(texts)
+
+
+def _embed_with_retry(texts):
+    for attempt in range(EMBED_MAX_RETRIES):
+        try:
+            resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
+            return [d.embedding for d in resp.data]
+        except RateLimitError as e:
+            _rate_limit_backoff(e, attempt)
+
+
+def _rate_limit_backoff(exc, attempt):
+    """Sleep out a 429 before the next attempt, or re-raise once attempts are
+    exhausted. Prefers the server's Retry-After header (Azure says exactly
+    when the quota window refills); falls back to exponential backoff capped
+    at the typical one-minute window."""
+    if attempt >= EMBED_MAX_RETRIES - 1:
+        raise exc
+    retry_after = exc.response.headers.get("retry-after", "") if exc.response is not None else ""
+    delay = int(retry_after) if retry_after.isdigit() else min(60, 2 ** (attempt + 1))
+    log(f"[embed] rate limited (429), waiting {delay}s (attempt {attempt + 1}/{EMBED_MAX_RETRIES})")
+    time.sleep(delay)
 
 
 def chunk_payloads(project, name, rel_path, text, ext, file_size_bytes,

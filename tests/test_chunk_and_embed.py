@@ -1,6 +1,9 @@
 import subprocess
+from types import SimpleNamespace
 
+import httpx
 import pytest
+from openai import RateLimitError
 
 import chunk_and_embed as cae
 
@@ -388,3 +391,55 @@ class TestIndexPullRequests:
         cae.index_pull_requests(object(), "https://dev.azure.com/org", "proj", "repo", state)
 
         assert state["pull_requests"]["proj/repo"]["last_pr_id"] == 3
+
+
+class TestEmbedBatchRateLimitRetry:
+    @staticmethod
+    def _make_429(headers=None):
+        request = httpx.Request("POST", "http://localhost:9999/v1/embeddings")
+        response = httpx.Response(429, headers=headers or {}, request=request)
+        return RateLimitError("rate limited", response=response, body=None)
+
+    def test_retries_until_success(self, monkeypatch):
+        sleeps = []
+        monkeypatch.setattr(cae.time, "sleep", sleeps.append)
+        attempts = []
+
+        def create(model, input):
+            attempts.append(model)
+            if len(attempts) < 3:
+                raise self._make_429()
+            return SimpleNamespace(data=[SimpleNamespace(embedding=[0.1, 0.2])])
+
+        monkeypatch.setattr(cae.client.embeddings, "create", create)
+
+        assert cae.embed_batch(["hello"]) == [[0.1, 0.2]]
+        assert len(attempts) == 3
+        assert sleeps == [2, 4]  # exponential backoff, no Retry-After header
+
+    def test_honors_retry_after_header(self, monkeypatch):
+        sleeps = []
+        monkeypatch.setattr(cae.time, "sleep", sleeps.append)
+        attempts = []
+
+        def create(model, input):
+            attempts.append(model)
+            if len(attempts) < 2:
+                raise self._make_429(headers={"retry-after": "17"})
+            return SimpleNamespace(data=[SimpleNamespace(embedding=[0.0])])
+
+        monkeypatch.setattr(cae.client.embeddings, "create", create)
+
+        cae.embed_batch(["hello"])
+        assert sleeps == [17]
+
+    def test_raises_after_attempts_exhausted(self, monkeypatch):
+        monkeypatch.setattr(cae.time, "sleep", lambda s: None)
+
+        def create(model, input):
+            raise self._make_429()
+
+        monkeypatch.setattr(cae.client.embeddings, "create", create)
+
+        with pytest.raises(RateLimitError):
+            cae.embed_batch(["hello"])
