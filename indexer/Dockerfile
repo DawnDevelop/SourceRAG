@@ -10,6 +10,7 @@ COPY . .
 RUN chmod +x run.sh git-askpass.sh
 
 ENV GIT_ASKPASS=/app/git-askpass.sh \
-    GIT_TERMINAL_PROMPT=0
+    GIT_TERMINAL_PROMPT=0 \
+    PYTHONUNBUFFERED=1
 
 ENTRYPOINT ["./run.sh"]
