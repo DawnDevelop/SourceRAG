@@ -145,8 +145,9 @@ def config_fingerprint():
         # BOM handling, the minified/import-chunk skip heuristics, and the
         # storage backend -- anything that alters chunk content or layout
         # without touching the knobs above. Bumped to 4 for the content_hash
-        # and content_type columns (dedup report + wiki/PR indexing).
-        "pipeline_version": 4,
+        # and content_type columns (dedup report + wiki/PR indexing); to 5 for
+        # the symbols column (definition lookup) which every chunk must carry.
+        "pipeline_version": 5,
     }
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -172,12 +173,40 @@ def _write_state_to_disk(state):
 
 
 def update_repo_state(state, project, name, commit):
+    indexed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with state_lock:
-        state["repos"][f"{project}/{name}"] = {
-            "commit": commit,
-            "indexed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
+        state["repos"][f"{project}/{name}"] = {"commit": commit, "indexed_at": indexed_at}
         _write_state_to_disk(state)
+    record_repo_indexed(project, name, commit, indexed_at)
+
+
+def record_repo_indexed(project, name, commit, indexed_at):
+    # Mirror the just-written freshness into Postgres for the API's list_repos.
+    # Kept outside state_lock (it's a DB write, guarded by db_lock instead) and
+    # separate from the JSON write so a DB hiccup here can't corrupt the state
+    # file that incremental indexing depends on.
+    #
+    # Best-effort: the repo's chunks are already committed by the time we reach
+    # here, so a failure must not fail the repo. Crucially it rolls back on
+    # error -- the shared _db_conn is serialized but not reset by db_lock, so an
+    # unrolled-back failure would leave the transaction aborted and poison every
+    # subsequent write from the other concurrent index_repo workers.
+    conn = get_conn()
+    with db_lock:
+        try:
+            conn.execute(
+                """
+                INSERT INTO repo_index_state (project, repo, commit_hash, indexed_at)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (project, repo) DO UPDATE SET
+                    commit_hash = EXCLUDED.commit_hash, indexed_at = EXCLUDED.indexed_at
+                """,
+                (project, name, commit, indexed_at),
+            )
+            conn.commit()
+        except psycopg.Error as e:
+            conn.rollback()
+            log(f"[freshness] {project}/{name}: could not record index state, skipping: {e}")
 
 
 def filename_is_skipped(fname):
@@ -230,6 +259,67 @@ def is_import_dominated(chunk):
         return False
     import_lines = sum(1 for line in lines if IMPORT_LINE_RE.match(line))
     return import_lines / len(lines) > 0.8
+
+
+# Symbol (definition) extraction: per-extension regexes capturing the NAME
+# being *defined* -- types, functions, methods -- so the API's find_definition
+# tool can answer "where is X defined" precisely, instead of matching every
+# chunk that merely mentions X. Deliberately regex, not a real parser: cheap
+# enough to run on every chunk, good enough to locate a definition. Each
+# pattern's group(1) is the defined name. False positives (the odd call
+# mistaken for a definition) only cost a little precision; a real AST/
+# tree-sitter chunker would be exact but is a far larger change.
+#
+# Possessive quantifiers (*+/++) on the "typed" function pattern below are
+# deliberate: without them the nested repetition backtracks catastrophically
+# on long non-matching lines. Python's re has supported them since 3.11.
+_TYPED_FN = re.compile(
+    r"^[ \t]*+"
+    r"(?!(?:return|if|for|while|switch|catch|foreach|else|do|await|yield|throw|new|lock|using)\b)"
+    r"(?:[A-Za-z_][\w<>\[\],.:?]*+[ \t*&]++)+([A-Za-z_]\w*+)[ \t]*+\(",
+    re.MULTILINE,
+)
+_TSJS = [
+    re.compile(r"\b(?:class|interface|enum|type)\s+([A-Za-z_$][\w$]*)"),
+    re.compile(r"\bfunction\s+([A-Za-z_$][\w$]*)"),
+    re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*"
+               r"(?:async\s+)?(?:function\b|\([^\n)]*\)\s*(?::[^\n={]+)?=>|[A-Za-z_$][\w$]*\s*=>)"),
+]
+SYMBOL_PATTERNS = {
+    ".py": [re.compile(r"^[ \t]*(?:async[ \t]+)?def[ \t]+(\w+)", re.MULTILINE),
+            re.compile(r"^[ \t]*class[ \t]+(\w+)", re.MULTILINE)],
+    ".cs": [re.compile(r"\b(?:class|interface|struct|enum|record)\s+(\w+)"), _TYPED_FN],
+    ".ts": _TSJS, ".tsx": _TSJS, ".js": _TSJS, ".jsx": _TSJS,
+    ".java": [re.compile(r"\b(?:class|interface|enum|record)\s+(\w+)"), _TYPED_FN],
+    ".go": [re.compile(r"\bfunc\s+(?:\([^)\n]*\)\s*)?(\w+)"), re.compile(r"\btype\s+(\w+)")],
+    ".rb": [re.compile(r"^[ \t]*def[ \t]+([\w?!=]+)", re.MULTILINE),
+            re.compile(r"^[ \t]*(?:class|module)[ \t]+(\w+)", re.MULTILINE)],
+    ".php": [re.compile(r"\bfunction\s+(\w+)"), re.compile(r"\b(?:class|interface|trait)\s+(\w+)")],
+    ".rs": [re.compile(r"\bfn\s+(\w+)"), re.compile(r"\b(?:struct|enum|trait|union)\s+(\w+)"),
+            re.compile(r"\btype\s+(\w+)")],
+    ".kt": [re.compile(r"\bfun\s+(\w+)"), re.compile(r"\b(?:class|interface|object)\s+(\w+)")],
+    ".scala": [re.compile(r"\bdef\s+(\w+)"), re.compile(r"\b(?:class|trait|object)\s+(\w+)")],
+    ".swift": [re.compile(r"\bfunc\s+(\w+)"),
+               re.compile(r"\b(?:class|struct|enum|protocol|extension)\s+(\w+)")],
+    ".c": [re.compile(r"\b(?:struct|enum|union)\s+(\w+)"), _TYPED_FN],
+    ".cpp": [re.compile(r"\b(?:struct|class|enum|union)\s+(\w+)"), _TYPED_FN],
+    ".ps1": [re.compile(r"\bfunction\s+([\w-]+)", re.IGNORECASE)],
+    ".psm1": [re.compile(r"\bfunction\s+([\w-]+)", re.IGNORECASE)],
+    ".lua": [re.compile(r"\b(?:local[ \t]+)?function\s+([\w.:]+)")],
+}
+
+
+def extract_symbols(text, ext):
+    """Names defined in `text`, per the language of `ext`. Empty for
+    extensions with no pattern set (data/config/markdown), which is fine --
+    those just contribute nothing to definition lookup."""
+    patterns = SYMBOL_PATTERNS.get(ext.lower())
+    if not patterns:
+        return set()
+    names = set()
+    for pat in patterns:
+        names.update(m.group(1) for m in pat.finditer(text))
+    return names
 
 
 def get_head_commit(repo_root):
@@ -433,8 +523,20 @@ CREATE TABLE IF NOT EXISTS chunks (
     commit_hash text,
     commit_date text,
     content_hash text,
+    symbols text,
     text text NOT NULL,
     embedding vector({dim}) NOT NULL
+);
+-- Per-repo index freshness, projected into Postgres so the API (which has no
+-- access to the indexer-only state file) can report how current each repo is.
+-- The .index_state.json file remains the source of truth for incremental
+-- decisions; this table is a read-only mirror for the API's list_repos.
+CREATE TABLE IF NOT EXISTS repo_index_state (
+    project text NOT NULL,
+    repo text NOT NULL,
+    commit_hash text,
+    indexed_at text,
+    PRIMARY KEY (project, repo)
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_repo_path ON chunks (project, repo, path);
 CREATE INDEX IF NOT EXISTS idx_chunks_content_type ON chunks (content_type);
@@ -443,6 +545,10 @@ CREATE INDEX IF NOT EXISTS idx_chunks_content_hash ON chunks (content_hash);
 -- Lexical leg of hybrid search. 'simple' config: no stemming/stopwords, so
 -- code identifiers (CamelCase names, etc.) match exactly as written.
 CREATE INDEX IF NOT EXISTS idx_chunks_fts ON chunks USING gin (to_tsvector('simple', text));
+-- Definition lookup (find_definition): same 'simple' config over the names a
+-- chunk defines. coalesce so the NULL symbols of pattern-less languages index
+-- cleanly. Must match the query expression in api/main.py exactly to be used.
+CREATE INDEX IF NOT EXISTS idx_chunks_symbols ON chunks USING gin (to_tsvector('simple', coalesce(symbols, '')));
 CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON chunks USING hnsw (embedding vector_cosine_ops);
 """
 
@@ -464,10 +570,12 @@ def ensure_schema():
 def reset_index():
     # Used when the config fingerprint changed (or on first run) -- old
     # chunks aren't comparable to what a new config would produce, so they
-    # can't be kept around.
+    # can't be kept around. The freshness mirror goes too, so it never lists
+    # a repo whose chunks were just dropped.
     conn = get_conn()
     with db_lock:
         conn.execute("DROP TABLE IF EXISTS chunks")
+        conn.execute("DROP TABLE IF EXISTS repo_index_state")
         conn.commit()
     ensure_schema()
 
@@ -499,7 +607,7 @@ def add_chunks(ids, payloads, texts, vectors):
             cid, p["project"], p["repo"], p["path"], p["language"], p["content_type"],
             p["start_line"], p["end_line"], p["file_size_bytes"],
             p["chunk_tokens_estimate"], p["commit_hash"], p["commit_date"], p["content_hash"],
-            text, vector_literal(vec),
+            p["symbols"], text, vector_literal(vec),
         )
         for cid, p, text, vec in zip(ids, payloads, texts, vectors)
     ]
@@ -510,8 +618,8 @@ def add_chunks(ids, payloads, texts, vectors):
                 """
                 INSERT INTO chunks (id, project, repo, path, language, content_type, start_line, end_line,
                                     file_size_bytes, chunk_tokens_estimate, commit_hash, commit_date,
-                                    content_hash, text, embedding)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector)
+                                    content_hash, symbols, text, embedding)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector)
                 ON CONFLICT (id) DO UPDATE SET
                     project = EXCLUDED.project, repo = EXCLUDED.repo, path = EXCLUDED.path,
                     language = EXCLUDED.language, content_type = EXCLUDED.content_type,
@@ -519,7 +627,8 @@ def add_chunks(ids, payloads, texts, vectors):
                     file_size_bytes = EXCLUDED.file_size_bytes,
                     chunk_tokens_estimate = EXCLUDED.chunk_tokens_estimate,
                     commit_hash = EXCLUDED.commit_hash, commit_date = EXCLUDED.commit_date,
-                    content_hash = EXCLUDED.content_hash, text = EXCLUDED.text, embedding = EXCLUDED.embedding
+                    content_hash = EXCLUDED.content_hash, symbols = EXCLUDED.symbols,
+                    text = EXCLUDED.text, embedding = EXCLUDED.embedding
                 """,
                 rows,
             )
@@ -613,6 +722,7 @@ def chunk_payloads(project, name, rel_path, text, ext, file_size_bytes,
             "commit_hash": commit_hash,
             "commit_date": commit_date,
             "content_hash": content_hash(chunk),
+            "symbols": " ".join(sorted(extract_symbols(chunk, ext))),
         }
         yield chunk_id(project, name, rel_path, i), payload, chunk, embed_header + chunk
 

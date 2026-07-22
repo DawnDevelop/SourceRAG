@@ -91,7 +91,7 @@ Parameters:
 
 Each hit reports `matched_by` (`semantic`, `lexical`, or `both`) and, where copies were collapsed, a `duplicates` list of the other locations.
 
-MCP: the server lives at `http://localhost:4141/mcp/` (streamable HTTP) and exposes a single `search_code` tool with the same parameters (there `max_chars` defaults to 2500 to stay within MCP token limits). `.mcp.json` in this repo registers the URL for Claude Code — deliberately without credentials, since the file is committed. Two ways to connect:
+MCP: the server lives at `http://localhost:4141/mcp/` (streamable HTTP) and exposes `search_code` with the same parameters (there `max_chars` defaults to 2500 to stay within MCP token limits), alongside `get_file_context`, `list_repos`, and `find_definition` (see [Tools for agents](#tools-for-agents)) and `find_duplicates` (see [Finding duplicate code](#finding-duplicate-code)). `.mcp.json` in this repo registers the URL for Claude Code — deliberately without credentials, since the file is committed. Two ways to connect:
 
 - **Agent (API key):** register the server with the key as a header, outside version control — e.g. in user scope:
 
@@ -100,6 +100,53 @@ MCP: the server lives at `http://localhost:4141/mcp/` (streamable HTTP) and expo
   ```
 
 - **Human (OAuth):** connect without a header; the client receives a 401, discovers the resource metadata, and runs its built-in OAuth flow against the configured issuer (see [Authentication](#authentication) for the Entra caveat).
+
+## Tools for agents
+
+Search finds the right chunk; these three give an agent the primitives search alone doesn't. Each is a REST endpoint and an MCP tool of the same purpose, sharing one implementation.
+
+### Reading around a hit — `/file` (`get_file_context`)
+
+A search hit is a single ~1500-char chunk. `/file` reassembles a whole indexed file (or a line window of it) from its stored chunks, so an agent can see the enclosing function or the rest of a class without re-querying and hoping the neighbouring chunk surfaces.
+
+```sh
+curl -H "Authorization: Bearer $AGENT_API_KEY" \
+  "http://localhost:4141/file?project=Payments&repo=billing&path=src/Retry.cs&from_line=40&to_line=90"
+```
+
+| Parameter                | Meaning                                                                                     |
+| ------------------------ | ------------------------------------------------------------------------------------------- |
+| `project`/`repo`/`path`  | Required. The exact triple a search hit reports.                                            |
+| `from_line`/`to_line`    | Optional 1-based line window; omit (or `0`) for the whole file.                             |
+| `max_chars`              | Truncate returned text (`"truncated": true` marks it). `0` = full text (MCP default 6000).  |
+
+Reconstruction is **approximate**: chunks overlap (deduplicated by line) and pure-import chunks are dropped at index time, so the response carries a `gaps` list of line ranges with no stored content. It's context, not a byte-exact copy from git — read the file from the repo when you need exactness.
+
+### Discovering what's indexed — `/repos` (`list_repos`)
+
+`repo` and `language` are exact-match filters, useless unless you already know the valid values. `/repos` reports every indexed repo with its chunk/file counts and **index freshness** (last-indexed commit + timestamp), the languages present, and the total chunk count — so an agent can scope a search instead of guessing, and judge how current an answer is (freshness is `null` for repos indexed before this was added and not rebuilt since).
+
+```sh
+curl -H "Authorization: Bearer $AGENT_API_KEY" "http://localhost:4141/repos"
+```
+
+### Jumping to a definition — `/definitions` (`find_definition`)
+
+Where `/search` ranks any chunk that *mentions* a term, `/definitions` returns only chunks that **define** the named symbol (class/interface/struct/enum, or function/method), via a `symbols` column the indexer populates per chunk.
+
+```sh
+curl -H "Authorization: Bearer $AGENT_API_KEY" \
+  "http://localhost:4141/definitions?name=AuthenticateAsync&language=cs"
+```
+
+| Parameter       | Meaning                                                                    |
+| --------------- | -------------------------------------------------------------------------- |
+| `name`          | Required. The exact symbol identifier to locate the definition of.         |
+| `repo`, `language`, `path_contains` | Same filters as `/search`.                             |
+| `top_k`         | Results to return (default 8, capped at 50).                               |
+| `max_chars`     | Truncate each hit's text. Each hit also carries a `symbols` field.         |
+
+Definition detection is **regex-based per language** (see `SYMBOL_PATTERNS` in `indexer/chunk_and_embed.py`) covering the common declaration forms — not a full parser. If a definition isn't found this way, fall back to `search_code`. Populating the `symbols` column bumps the pipeline fingerprint, so enabling this triggers one full reindex (see [Keeping the index fresh](#keeping-the-index-fresh)).
 
 ## Finding duplicate code
 
@@ -134,7 +181,7 @@ To force a full rebuild from scratch: `docker compose down -v` (drops both the c
 
 ## What gets indexed
 
-Binary/asset extensions, dependency lockfiles, minified bundles (`*.min.js` and a line-length heuristic for unmarked ones), source maps, and data/locale directories (`node_modules`, `fixtures`, `locales`, …) are skipped — see `SKIP_DIRS` / `SKIP_EXT` / `SKIP_FILENAMES` in `indexer/chunk_and_embed.py`. Chunks that are almost entirely import statements are dropped. Each chunk is embedded with a `// project/repo/path` header prepended so the vector carries its location context, while the stored text stays raw.
+Binary/asset extensions, dependency lockfiles, minified bundles (`*.min.js` and a line-length heuristic for unmarked ones), source maps, and data/locale directories (`node_modules`, `fixtures`, `locales`, …) are skipped — see `SKIP_DIRS` / `SKIP_EXT` / `SKIP_FILENAMES` in `indexer/chunk_and_embed.py`. Chunks that are almost entirely import statements are dropped. Each chunk is embedded with a `// project/repo/path` header prepended so the vector carries its location context, while the stored text stays raw. Each chunk also records the symbol names it defines (regex-extracted per language) in a `symbols` column, powering [`find_definition`](#tools-for-agents).
 
 Every chunk carries a `content_type`: `code` by default, or `wiki`/`pr` when the optional indexing below is enabled — see [Configuration](#configuration) to turn these on.
 

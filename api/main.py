@@ -270,6 +270,164 @@ def find_duplicate_clusters(min_repos: int = 2, min_chars: int = DEFAULT_DUPLICA
     ]
 
 
+def _find_gaps(present, lo, hi) -> list[dict]:
+    """Line ranges in [lo, hi] with no stored content -- dropped import chunks,
+    or a file whose top/middle wasn't indexed. `present` is the set (or dict
+    keyed by) of line numbers that DO have content."""
+    gaps, run_start = [], None
+    for ln in range(lo, hi + 1):
+        if ln not in present:
+            run_start = run_start if run_start is not None else ln
+            continue
+        if run_start is not None:
+            gaps.append({"start_line": run_start, "end_line": ln - 1})
+            run_start = None
+    if run_start is not None:
+        gaps.append({"start_line": run_start, "end_line": hi})
+    return gaps
+
+
+def stitch_chunks(chunks, from_line: int = 0, to_line: int = 0):
+    """Reassemble a file from its stored chunks. Pure function; `chunks` is a
+    list of {"start_line", "end_line", "text"}. Returns (text, gaps).
+
+    Reconstruction is approximate by design -- chunks overlap (deduped here by
+    line number: the first chunk to supply a line wins) and import-dominated
+    chunks were dropped at index time (surfaced as gaps). It is context, not a
+    byte-exact copy of the file in git. Optional from_line/to_line clip the
+    output to a window (e.g. the neighbourhood of a search hit)."""
+    line_map = {}
+    for c in sorted(chunks, key=lambda c: c["start_line"]):
+        for i, line in enumerate(c["text"].splitlines()):
+            line_map.setdefault(c["start_line"] + i, line)
+    if not line_map:
+        return "", []
+    lo = from_line if from_line > 0 else 1
+    hi = min(to_line, max(line_map)) if to_line > 0 else max(line_map)
+    present = {ln: line_map[ln] for ln in line_map if lo <= ln <= hi}
+    if not present:
+        return "", []
+    text = "\n".join(present[ln] for ln in sorted(present))
+    return text, _find_gaps(present, lo, hi)
+
+
+def file_context(project: str, repo: str, path: str, from_line: int = 0,
+                 to_line: int = 0, max_chars: int = 0) -> dict:
+    """Reconstruct one indexed file's text from its stored chunks. See
+    stitch_chunks for the fidelity caveats. Named differently from the
+    get_file_context MCP tool that wraps it, so the tool doesn't shadow it."""
+    sql = """
+        SELECT start_line, end_line, text FROM chunks
+        WHERE project = %s AND repo = %s AND path = %s
+        ORDER BY start_line
+    """
+    with get_conn() as conn:
+        try:
+            rows = conn.execute(sql, [project, repo, path]).fetchall()
+        except psycopg.errors.UndefinedTable as e:
+            raise IndexNotReady(
+                f"The chunks table does not exist -- has the indexer completed a first run? ({e})"
+            ) from e
+    base = {"project": project, "repo": repo, "path": path}
+    if not rows:
+        return {**base, "found": False, "text": "",
+                "note": "No indexed chunks for this exact project/repo/path -- check list_repos "
+                        "for indexed repo names, or the file may have been skipped at index time."}
+    chunks = [{"start_line": r[0], "end_line": r[1], "text": r[2]} for r in rows]
+    text, gaps = stitch_chunks(chunks, from_line, to_line)
+    truncated = max_chars > 0 and len(text) > max_chars
+    return {**base, "found": True,
+            "text": text[:max_chars] if truncated else text,
+            "truncated": truncated, "gaps": gaps,
+            "indexed_start_line": min(c["start_line"] for c in chunks),
+            "indexed_end_line": max(c["end_line"] for c in chunks)}
+
+
+def _repo_freshness(conn) -> dict:
+    """(project, repo) -> {last_indexed_commit, last_indexed_at} from the
+    indexer's freshness mirror. Absent table (index predates the feature and
+    hasn't been rebuilt) is not fatal -- freshness is then simply unknown."""
+    try:
+        rows = conn.execute(
+            "SELECT project, repo, commit_hash, indexed_at FROM repo_index_state"
+        ).fetchall()
+    except psycopg.errors.UndefinedTable:
+        conn.rollback()  # clear the aborted transaction so nothing after us fails
+        return {}
+    return {(r[0], r[1]): {"last_indexed_commit": r[2], "last_indexed_at": r[3]} for r in rows}
+
+
+def list_repositories() -> dict:
+    """What's actually in the index: repos (with chunk/file counts and index
+    freshness), languages, and the total chunk count -- so an agent can learn
+    valid `repo`/`language` filter values instead of guessing, and judge how
+    current an answer is."""
+    with get_conn() as conn:
+        try:
+            repo_rows = conn.execute("""
+                SELECT project, repo, content_type, count(*), count(DISTINCT path)
+                FROM chunks GROUP BY project, repo, content_type
+                ORDER BY project, repo, content_type
+            """).fetchall()
+            lang_rows = conn.execute("""
+                SELECT language, count(*) FROM chunks GROUP BY language ORDER BY count(*) DESC
+            """).fetchall()
+        except psycopg.errors.UndefinedTable as e:
+            raise IndexNotReady(
+                f"The chunks table does not exist -- has the indexer completed a first run? ({e})"
+            ) from e
+        freshness = _repo_freshness(conn)  # last: an aborted lookup mustn't poison the reads above
+    unknown = {"last_indexed_commit": None, "last_indexed_at": None}
+    repos = [
+        {"project": r[0], "repo": r[1], "content_type": r[2], "chunks": r[3], "files": r[4],
+         **freshness.get((r[0], r[1]), unknown)}
+        for r in repo_rows
+    ]
+    return {
+        "repositories": repos,
+        "languages": [{"language": r[0], "chunks": r[1]} for r in lang_rows],
+        "total_chunks": sum(r[3] for r in repo_rows),
+    }
+
+
+def find_definitions(name: str, repo: Optional[str] = None, language: Optional[str] = None,
+                     path_contains: Optional[str] = None, top_k: int = 8,
+                     max_chars: int = 0) -> list[dict]:
+    """Chunks that *define* `name` (class/type/function/method), via the
+    symbols column the indexer populates -- distinct from search_code, which
+    matches any mention. Returns the same hit shape plus a `symbols` field."""
+    top_k = max(1, min(top_k, MAX_TOP_K))
+    token = " ".join(re.findall(r"[A-Za-z0-9_]+", name))
+    if not token:
+        return []
+    filters, params = filter_clauses(repo, language, path_contains)
+    sql = f"""
+        SELECT {HIT_COLUMNS}, symbols,
+               ts_rank(to_tsvector('simple', coalesce(symbols, '')), query) AS rank
+        FROM chunks, websearch_to_tsquery('simple', %s) query
+        WHERE to_tsvector('simple', coalesce(symbols, '')) @@ query{filters}
+        ORDER BY rank DESC
+        LIMIT %s
+    """
+    with get_conn() as conn:
+        try:
+            rows = conn.execute(sql, [token, *params, top_k]).fetchall()
+        except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
+            raise IndexNotReady(
+                f"The chunks table isn't ready for definition lookup -- has the indexer completed "
+                f"a full reindex since this feature was added? ({e})"
+            ) from e
+    hits = rows_to_hits(rows)
+    for hit, row in zip(hits, rows):
+        hit["symbols"] = row[12]
+        text = hit.pop("text")
+        truncated = max_chars > 0 and len(text) > max_chars
+        hit["text"] = text[:max_chars] if truncated else text
+        if truncated:
+            hit["truncated"] = True
+    return hits
+
+
 # MCP tools -- share search_chunks/find_duplicate_clusters with the REST
 # routes below rather than calling them over HTTP, so there's exactly one
 # implementation of each.
@@ -386,6 +544,87 @@ def find_duplicates(min_repos: int = 2, min_chars: int = DEFAULT_DUPLICATE_MIN_C
     return find_duplicate_clusters(min_repos, min_chars, limit, content_type)
 
 
+@mcp.tool()
+def get_file_context(project: str, repo: str, path: str, from_line: int = 0,
+                     to_line: int = 0, max_chars: int = 6000) -> dict:
+    """Reassemble an indexed file's text from its stored chunks, so you can see
+    the code *around* a search hit -- the enclosing function, the rest of a
+    class -- without re-querying and hoping the neighbouring chunk surfaces.
+
+    USE FOR: expanding context after search_code/find_definition returns a hit
+    whose chunk is cut off ("show me the whole method", "what's above/below
+    this"). Pass the hit's exact project/repo/path; narrow to a window with
+    from_line/to_line (e.g. a bit either side of the hit's start_line).
+
+    DO NOT USE FOR: files in the session's own working repo (read them
+    directly), or discovering which files exist (use search_code / list_repos).
+
+    Reconstruction is approximate: chunks overlap (deduped by line) and pure-
+    import chunks were dropped at index time, so `gaps` lists line ranges with
+    no stored content. It is context, not a byte-exact copy from git.
+
+    Args:
+        project: Exact project name of the file (as returned by a search hit).
+        repo: Exact repo name of the file.
+        path: Exact file path of the file.
+        from_line: Optional first line to return (1-based); 0 = from the start.
+        to_line: Optional last line to return; 0 = to the end.
+        max_chars: Truncate the returned text to this many chars (sets
+            "truncated": true). Default 6000; pass 0 for untruncated.
+    """
+    return file_context(project, repo, path, from_line, to_line, max_chars)
+
+
+@mcp.tool()
+def list_repos() -> dict:
+    """Inventory of what is actually indexed: every repo with its chunk/file
+    counts and index freshness (last-indexed commit + timestamp), the languages
+    present, and the total chunk count.
+
+    USE FOR: learning valid `repo` and `language` filter values before calling
+    search_code (so you can scope a search instead of guessing names), checking
+    whether a given repo is indexed at all, and judging how current the index
+    is (a repo last indexed weeks ago may be stale). Call this first when you're
+    unsure what the org's index covers.
+
+    Freshness may be null for repos indexed before freshness tracking existed
+    and not rebuilt since.
+    """
+    return list_repositories()
+
+
+@mcp.tool()
+def find_definition(name: str, repo: str = "", language: str = "",
+                    path_contains: str = "", top_k: int = 8, max_chars: int = 2500) -> list[dict]:
+    """Find where a symbol is DEFINED -- the class/interface/struct/enum or the
+    function/method declaration named `name` -- rather than everywhere it is
+    merely mentioned.
+
+    USE FOR: "where is X defined/declared/implemented", jumping to the source
+    of a class or function by its exact name. This is the precise counterpart
+    to search_code: search_code ranks any chunk that references the term;
+    find_definition returns only chunks whose *declarations* include it.
+
+    DO NOT USE FOR: conceptual/natural-language queries ("retry logic for http
+    calls") -- use search_code. Definition detection is regex-based per
+    language, so it covers the common declaration forms but isn't a full
+    parser; if a definition isn't found this way, fall back to search_code.
+
+    Args:
+        name: The symbol name to locate the definition of (exact identifier).
+        repo: Optional exact repo name to filter to.
+        language: Optional file extension to filter to (e.g. "cs", "py", "ts").
+        path_contains: Optional substring the file path must contain.
+        top_k: Max results to return (default 8, capped at 50).
+        max_chars: Truncate each hit's text to this many chars (sets
+            "truncated": true). Default 2500; pass 0 for untruncated.
+
+    Each hit carries a `symbols` field listing every name that chunk defines.
+    """
+    return find_definitions(name, repo or None, language or None,
+                            path_contains or None, top_k, max_chars)
+
+
 mcp_app = mcp.streamable_http_app()
 
 
@@ -437,5 +676,31 @@ def duplicates(min_repos: int = 2, min_chars: int = DEFAULT_DUPLICATE_MIN_CHARS,
                limit: int = 50, content_type: str = "code"):
     try:
         return find_duplicate_clusters(min_repos, min_chars, limit, content_type)
+    except IndexNotReady as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/file", dependencies=[Depends(require_auth)])
+def file(project: str, repo: str, path: str, from_line: int = 0,
+         to_line: int = 0, max_chars: int = 0):
+    try:
+        return file_context(project, repo, path, from_line, to_line, max_chars)
+    except IndexNotReady as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/repos", dependencies=[Depends(require_auth)])
+def repos():
+    try:
+        return list_repositories()
+    except IndexNotReady as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/definitions", dependencies=[Depends(require_auth)])
+def definitions(name: str, repo: Optional[str] = None, language: Optional[str] = None,
+                path_contains: Optional[str] = None, top_k: int = 8, max_chars: int = 0):
+    try:
+        return find_definitions(name, repo, language, path_contains, top_k, max_chars)
     except IndexNotReady as e:
         raise HTTPException(status_code=503, detail=str(e))

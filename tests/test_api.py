@@ -139,6 +139,52 @@ class TestFuseHits:
         assert "id" not in hits[0] and "rrf" not in hits[0]
 
 
+class TestStitchChunks:
+    def test_contiguous_chunks_join_in_order(self):
+        chunks = [
+            {"start_line": 3, "end_line": 4, "text": "c\nd"},
+            {"start_line": 1, "end_line": 2, "text": "a\nb"},
+        ]
+        text, gaps = main.stitch_chunks(chunks)
+        assert text == "a\nb\nc\nd"
+        assert gaps == []
+
+    def test_overlapping_lines_deduped(self):
+        chunks = [
+            {"start_line": 1, "end_line": 3, "text": "a\nb\nc"},
+            {"start_line": 3, "end_line": 4, "text": "c\nd"},
+        ]
+        text, _ = main.stitch_chunks(chunks)
+        assert text == "a\nb\nc\nd"
+
+    def test_leading_gap_reported(self):
+        text, gaps = main.stitch_chunks([{"start_line": 5, "end_line": 6, "text": "e\nf"}])
+        assert text == "e\nf"
+        assert gaps == [{"start_line": 1, "end_line": 4}]
+
+    def test_interior_gap_reported(self):
+        chunks = [
+            {"start_line": 1, "end_line": 2, "text": "a\nb"},
+            {"start_line": 5, "end_line": 6, "text": "e\nf"},
+        ]
+        text, gaps = main.stitch_chunks(chunks)
+        assert text == "a\nb\ne\nf"
+        assert gaps == [{"start_line": 3, "end_line": 4}]
+
+    def test_window_clips_output(self):
+        chunks = [{"start_line": 1, "end_line": 5, "text": "a\nb\nc\nd\ne"}]
+        text, gaps = main.stitch_chunks(chunks, from_line=2, to_line=4)
+        assert text == "b\nc\nd"
+        assert gaps == []
+
+    def test_window_past_stored_content_returns_empty(self):
+        chunks = [{"start_line": 1, "end_line": 2, "text": "a\nb"}]
+        assert main.stitch_chunks(chunks, from_line=50) == ("", [])
+
+    def test_empty_returns_empty(self):
+        assert main.stitch_chunks([]) == ("", [])
+
+
 class TestGetConn:
     def test_unreachable_database_raises_index_not_ready(self):
         with pytest.raises(main.IndexNotReady, match="not reachable"):

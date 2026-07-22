@@ -1,4 +1,5 @@
 import subprocess
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -300,6 +301,51 @@ class TestEmbedFilesCommitMap:
 
         with pytest.raises(RuntimeError, match="git log failed"):
             cae.embed_files("proj", "repo", str(tmp_path), [spec])
+
+
+class TestExtractSymbols:
+    def test_python_def_and_class(self):
+        text = "class Foo:\n    def bar(self):\n        pass\n    async def baz(self):\n        pass\n"
+        assert cae.extract_symbols(text, ".py") == {"Foo", "bar", "baz"}
+
+    def test_csharp_types_and_methods(self):
+        text = ("public class AuthHandler\n{\n"
+                "    public async Task AuthenticateAsync(string t)\n    {\n    }\n"
+                "    private int Compute(int x) { return x; }\n}\n")
+        syms = cae.extract_symbols(text, ".cs")
+        assert {"AuthHandler", "AuthenticateAsync", "Compute"} <= syms
+
+    def test_typed_fn_ignores_control_flow_and_calls(self):
+        text = "public void Run()\n{\n    if (x)\n    {\n    }\n    return Foo();\n}\n"
+        syms = cae.extract_symbols(text, ".cs")
+        assert "Run" in syms
+        assert not ({"if", "Foo", "return"} & syms)
+
+    def test_typescript_declarations(self):
+        text = ("export class Widget {}\n"
+                "function render() {}\n"
+                "const handler = (e) => {}\n"
+                "export const load = async () => {}\n")
+        assert cae.extract_symbols(text, ".ts") == {"Widget", "render", "handler", "load"}
+
+    def test_go_func_and_type(self):
+        text = "type Server struct {}\nfunc (s *Server) Start() {}\nfunc New() *Server {}\n"
+        assert cae.extract_symbols(text, ".go") == {"Server", "Start", "New"}
+
+    def test_extension_case_insensitive(self):
+        assert cae.extract_symbols("def foo():\n    pass", ".PY") == {"foo"}
+
+    def test_unknown_extension_returns_empty(self):
+        assert cae.extract_symbols("# Title\n\nsome text", ".md") == set()
+
+    def test_no_redos_on_pathological_input(self):
+        # The "modifiers, no opening paren" shape that blows up a backtracking
+        # regex. Possessive quantifiers keep _TYPED_FN linear -- guard with a
+        # wall-clock ceiling so a regression that reintroduces backtracking fails.
+        evil = "public static " + "a " * 5000 + "\n"
+        start = time.perf_counter()
+        cae.extract_symbols(evil, ".cs")
+        assert time.perf_counter() - start < 1.0
 
 
 class TestVectorLiteral:
